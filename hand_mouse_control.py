@@ -5,9 +5,13 @@ Hand-Controlled Desktop Mouse
 Controls the OS mouse cursor with hand gestures captured from a webcam.
 
 Pipeline:
-    Webcam (threaded capture) -> MediaPipe Hands (landmark detection)
+    Webcam (threaded capture) -> MediaPipe HandLandmarker (Tasks API)
     -> scale-invariant gesture classification -> majority-vote stabilizer
     -> One Euro Filter (smoothing) -> pyautogui (mouse control)
+
+On first run, this script automatically downloads the hand landmark model
+bundle (hand_landmarker.task, a few MB) into the same folder as this file.
+No manual download step is required.
 
 Gestures:
     MOVE          index fingertip position (default state, any other        -> move cursor
@@ -36,15 +40,19 @@ Run:
 
 import math
 import os
+import sys
 import time
 import platform
 import threading
+import urllib.request
 from collections import deque, Counter
 
 import cv2
 import numpy as np
 import pyautogui
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 # ----------------------------------------------------------------------------
 # Configuration constants (tune these to taste)
@@ -53,6 +61,13 @@ import mediapipe as mp
 CAM_INDEX = 0
 CAM_WIDTH, CAM_HEIGHT = 640, 480
 CAM_FPS = 30
+
+# Model bundle: auto-downloaded next to this script on first run.
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
+    "hand_landmarker/float16/1/hand_landmarker.task"
+)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task")
 
 # Fraction of the camera frame (from each edge) treated as "dead border".
 # Lets a smaller hand-movement range cover the entire screen.
@@ -108,7 +123,7 @@ pyautogui.FAILSAFE = True   # keep on: slam cursor to a screen corner to abort
 pyautogui.PAUSE = 0.0       # we manage our own timing/cooldowns
 
 # ----------------------------------------------------------------------------
-# MediaPipe hand landmark indices
+# Hand landmark indices (same layout as MediaPipe's 21-point hand model)
 # ----------------------------------------------------------------------------
 
 WRIST = 0
@@ -117,6 +132,49 @@ INDEX_MCP, INDEX_PIP, INDEX_TIP = 5, 6, 8
 MIDDLE_MCP, MIDDLE_PIP, MIDDLE_TIP = 9, 10, 12
 RING_MCP, RING_PIP, RING_TIP = 13, 14, 16
 PINKY_MCP, PINKY_PIP, PINKY_TIP = 17, 18, 20
+
+# Skeleton edges for drawing the hand overlay (drawn manually below instead
+# of relying on the legacy mp.solutions.drawing_utils module, which has been
+# unreliable/missing in recent mediapipe releases on some platforms).
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),          # thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),          # index
+    (5, 9), (9, 10), (10, 11), (11, 12),     # middle (+ palm)
+    (9, 13), (13, 14), (14, 15), (15, 16),   # ring (+ palm)
+    (13, 17), (17, 18), (18, 19), (19, 20),  # pinky (+ palm)
+    (0, 17),                                 # wrist to pinky base
+]
+
+
+# ----------------------------------------------------------------------------
+# Model download: fetch the hand landmark model bundle on first run.
+# ----------------------------------------------------------------------------
+
+def ensure_model():
+    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 0:
+        return MODEL_PATH
+
+    print(f"Hand landmark model not found. Downloading to:\n  {MODEL_PATH}")
+
+    def _progress(block_num, block_size, total_size):
+        if total_size <= 0:
+            return
+        pct = min(100, block_num * block_size * 100 // total_size)
+        sys.stdout.write(f"\r  {pct}%")
+        sys.stdout.flush()
+
+    try:
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH, _progress)
+        print("\nDownload complete.")
+    except Exception as e:
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)  # don't leave a partial/corrupt file behind
+        raise RuntimeError(
+            f"Failed to download hand landmark model from {MODEL_URL}.\n"
+            f"Check your internet connection, or download it manually and "
+            f"place it at {MODEL_PATH}.\nOriginal error: {e}"
+        )
+    return MODEL_PATH
 
 
 # ----------------------------------------------------------------------------
@@ -170,7 +228,7 @@ class OneEuroFilter:
 
 class ThreadedCamera:
     def __init__(self, index=0, width=640, height=480, fps=30):
-        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if cv2.os.name == "nt" else cv2.CAP_ANY)
+        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
         if not self.cap.isOpened():
             self.cap = cv2.VideoCapture(index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
@@ -293,6 +351,16 @@ def classify_gesture(landmarks):
     return "MOVE", index_tip
 
 
+def draw_hand_overlay(frame, landmarks, frame_w, frame_h):
+    """Manual landmark/skeleton overlay (no dependency on the legacy
+    mp.solutions.drawing_utils module)."""
+    pts = [(int(lm.x * frame_w), int(lm.y * frame_h)) for lm in landmarks]
+    for a, b in HAND_CONNECTIONS:
+        cv2.line(frame, pts[a], pts[b], (0, 200, 0), 2)
+    for p in pts:
+        cv2.circle(frame, p, 4, (0, 0, 255), -1)
+
+
 def switch_desktop(direction):
     """direction: 'left' or 'right'. Hotkeys are OS-dependent; Linux varies
     by desktop environment (this targets GNOME's default binding)."""
@@ -400,14 +468,16 @@ def normalized_to_screen(x, y, screen_w, screen_h, margin=FRAME_MARGIN):
 def main():
     screen_w, screen_h = pyautogui.size()
 
-    mp_hands = mp.solutions.hands
-    mp_draw = mp.solutions.drawing_utils
-    hands = mp_hands.Hands(
-        max_num_hands=1,
-        model_complexity=0,          # 0 = fastest, lowest CPU (good for real-time control)
-        min_detection_confidence=0.7,
+    model_path = ensure_model()
+    base_options = mp_python.BaseOptions(model_asset_path=model_path)
+    hand_options = mp_vision.HandLandmarkerOptions(
+        base_options=base_options,
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=0.7,
         min_tracking_confidence=0.7,
     )
+    landmarker = mp_vision.HandLandmarker.create_from_options(hand_options)
 
     cam = ThreadedCamera(CAM_INDEX, CAM_WIDTH, CAM_HEIGHT, CAM_FPS).start()
 
@@ -429,6 +499,9 @@ def main():
     prev_t = time.time()
     fps_smooth = 0.0
 
+    start_time = time.time()
+    last_timestamp_ms = -1
+
     try:
         while True:
             frame = cam.read()
@@ -438,15 +511,23 @@ def main():
 
             frame = cv2.flip(frame, 1)  # mirror view so movement feels natural
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = hands.process(rgb)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            # HandLandmarker's VIDEO mode requires strictly increasing
+            # millisecond timestamps.
+            timestamp_ms = int((time.time() - start_time) * 1000)
+            if timestamp_ms <= last_timestamp_ms:
+                timestamp_ms = last_timestamp_ms + 1
+            last_timestamp_ms = timestamp_ms
+
+            result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
             confirmed = "MOVE"
             now = time.time()
 
-            if results.multi_hand_landmarks:
-                hand_lms = results.multi_hand_landmarks[0]
-                mp_draw.draw_landmarks(frame, hand_lms, mp_hands.HAND_CONNECTIONS)
-                landmarks = hand_lms.landmark
+            if result.hand_landmarks:
+                landmarks = result.hand_landmarks[0]
+                draw_hand_overlay(frame, landmarks, CAM_WIDTH, CAM_HEIGHT)
 
                 raw_gesture, track_pt = classify_gesture(landmarks)
                 confirmed = stabilizer.push(raw_gesture)
@@ -554,7 +635,7 @@ def main():
         if dragging:
             pyautogui.mouseUp()
         cam.stop()
-        hands.close()
+        landmarker.close()
         cv2.destroyAllWindows()
 
 
